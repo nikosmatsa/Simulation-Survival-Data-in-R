@@ -1,0 +1,162 @@
+# =============================================================================
+#                     WEIBULL AND EXPONENTIAL 
+#                         for gamma  = 1
+#                           WEIBULL  
+#                       for gamma  = 1.5
+#==============================================================================
+library(simsurv)
+library(eha)
+library(tidyverse)
+library(rsimsum)
+#==========================================================================
+
+
+
+Function1 <- function(rep, nobs = 500, prob = 0.5, lambda = 0.1, gamma = 1, beta = -0.5) {
+  df <- data.frame(
+    id = 1:nobs,
+    trt = rbinom(n = nobs, size = 1, prob = prob)
+  )
+  # Generate survival times and merge into df
+  # Generate times from a Weibull model including a binary
+  # treatment variable, with log(hazard ratio) = -0.5, and censoring
+  # after 5 years
+  # Generate survival times and merge into df
+  #  the output of the simsurv command gives us 
+  #  a data frame with a row for each individual, and the following three columns:
+  #  • id:        The individual identifier
+  #  • eventtime: The simulated event (or censoring) time
+  #  • status:    The event indicator, 1 for failure, 0 for censored
+  #  Here a special attention is needed because status variable is a maximum follow up time 
+  #  by censoring any individuals with a simulated survival time larger than five years.
+  s <- simsurv(lambdas = lambda, gammas = gamma, betas = c(trt = beta), x = df, maxt = 5)
+  df <- merge(df, s)
+  # phreg command in library(eha) reproduces proportional hazard regresion 
+  # models for different types of distribution
+  # in the dist parameter of phreg command.
+  # So the question is which distribution? Default is "weibull", 
+  # A special case like the exponential can be obtained 
+  # by choosing "weibull" in combination with shape = 1, 
+  # which is our task for the first data generating mechanism 
+  # as it presented in Tim Morris paper 
+  # Exponential model
+  fitexp <- phreg(Surv(eventtime, status) ~ trt, data = df, dist = "weibull", shape = 1)
+  thetaexp <- coef(fitexp)[["trt"]]
+  se_thetaexp <- sqrt(fitexp[["var"]]["trt", "trt"])
+  # Weibull model
+  fitwei <- phreg(Surv(eventtime, status) ~ trt, data = df, dist = "weibull")
+  thetawei <- coef(fitwei)[["trt"]]
+  se_thetawei <- sqrt(fitwei[["var"]]["trt", "trt"])
+  # Cox model
+  fitcox <- coxph(Surv(eventtime, status) ~ trt, df)
+  thetacox <- coef(fitcox)[["trt"]]
+  se_thetacox <- sqrt(fitcox[["var"]])
+  # Output coeffs and SEs
+  out <- data.frame(
+    rep = rep,
+    dgmgamma = gamma,
+    theta_1 = thetaexp,
+    se_1 = se_thetaexp,
+    theta_2 = thetawei,
+    se_2 = se_thetawei,
+    theta_3 = thetacox,
+    se_3 = se_thetacox
+  )
+  return(out)
+}
+
+
+# the following line will run once with large n_obs.
+
+Function1(1, nobs = 100000)
+
+
+# Preparation to run nsim repetitions
+set.seed(983452)
+nsim <- 1600
+# Empty estimates data frame to fill up.
+# Note - requires nsim*2 rows because 2 data-generating mechanisms
+# for diferent gammas 
+estimands <- data.frame(matrix(ncol = 8, nrow = (nsim*2)))
+x <- c("rep", "dgmgamma", "theta_1", "se_1", "theta_2", "se_2", "theta_3", "se_3")
+colnames(estimands) <- x
+states <- matrix(ncol = 626, nrow = (nsim*2))
+# Run all nsim reps
+for (r in 1:nsim) {
+   #1st data-generating mechanism
+  states[r, ] <- .Random.seed
+  estimands[r, ] <- Function1(rep = r, gamma=1)
+  # 2nd data-generating mechanism
+ states[(nsim+r), ] <- .Random.seed
+ estimands[(nsim+r), ] <- Function1(rep = r, gamma=1.5)
+}
+head(states)
+
+
+# Save data frame for analysis
+head(estimands)
+saveRDS(estimands, file = "estimands.rds")
+saveRDS(states, file = "states.rds")
+
+# Want to reproduce data from a particular rep? This is why we produced (and saved) states
+# Here is repetition 5, gamma = 1
+.Random.seed <- states[3,]
+Function1(rep = 5, gamma=1)
+# Now for repetition 222, gamma = 1.5
+.Random.seed <- states[(nsim+222),] # For the second data-generating mechanism, we stored state r in row nsim+r
+Function1(rep = 222, gamma=1.5)
+
+
+# Read estimates produced by runsim.R
+estimands <- readRDS("estimands.rds")
+estmlong <- estimands %>%
+  gather(key = "meththing", value = "est", -rep, -dgmgamma) %>% 
+  separate(meththing, into = c("thetase", "method"), sep = "_" ) %>% 
+  spread(thetase,est)
+estmlong$dgmgamma <- factor(estmlong$dgmgamma, levels = c(1,1.5), labels = c("gamma = 1", "gamma = 1.5"))
+estmlong$method <- factor(estmlong$method, levels = c(1,2,3), labels = c("Exponential", "Weibull", "Cox"))
+head(estmlong)
+
+
+# Run simsum to estimate performances
+total <- rsimsum::simsum(
+  data = estmlong, estvarname = "theta", true = -.5 , se = "se",
+  methodvar = "method", ref = "Weibull", by = "dgmgamma", x = TRUE
+)
+summary(total)
+
+autoplot(total, type = "heat", stats = "bias") +
+  viridis::scale_fill_viridis()
+# Comparison of theta according to method
+autoplot(total, type = "est")
+autoplot(total, type = "est_ba")
+# Comparison of SE according to method
+autoplot(total, type = "se")
+autoplot(total, type = "se_ba")
+# Ridge plots comparing theta
+autoplot(total, type = "est_ridge")
+autoplot(total, type = "se_ridge")
+# Zip plot
+# For each data-generating mechanism and method, 
+# the confidence intervals are centile-ranked according to 
+# their significance against the null hypothesis H0:θ=θtrue
+# assessed via a Wald-type test. 
+# This ranking is used for the vertical axis and 
+# is plotted against the intervals themselves.
+# When a method has 95% coverage, the colour 
+# of the intervals switches at 95 on the vertical axis.
+# Finally, the horizontal lines represent confidence intervals 
+# for the estimated coverage based on Monte Carlo standard errors.
+zip <- autoplot(total, type = "zip")
+zip
+ggsave(filename = "zipR.pdf", plot = last_plot(), device = "pdf",
+       scale = 1, width = 4, height = 6, units = "in")
+
+# Lollipop plot for bias  performance measure 
+autoplot(summary(total), type = "lolly", stats = "bias")
+# Lollipop plot for mse performance measure 
+autoplot(summary(total), type = "lolly", stats = "mse")
+
+
+
+ 
